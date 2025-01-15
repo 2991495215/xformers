@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
+from contextlib import nullcontext
 from copy import deepcopy
 
 import pytest
@@ -16,6 +17,7 @@ from xformers.checkpoint import (
     checkpoint,
     get_optimal_checkpoint_policy,
     list_operators,
+    selective_checkpoint_wrapper,
 )
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -27,26 +29,28 @@ if torch.cuda.is_available():
     cuda_cap = torch.cuda.get_device_capability(_devices[1])
 
 
-def _relu_policy(func, *args, **kwargs):
+def _relu_policy(ctx, func, *args, **kwargs):
     return func == torch.ops.aten.relu.default
 
 
-def _all_policy(func, *args, **kwargs):
+def _all_policy(ctx, func, *args, **kwargs):
     return True
 
 
-@pytest.mark.skipif(torch.__version__ < "2.2", reason="Only new PyTorch supported")
 @pytest.mark.parametrize("policy_fn", [None, [], _relu_policy, _all_policy])
 @pytest.mark.parametrize("input_requires_grad", [True, False])
 @pytest.mark.parametrize("device", _devices)
 @pytest.mark.parametrize("autocast", [True, False])
 def test_checkpoint(policy_fn, input_requires_grad, device, autocast):
-    module = nn.Sequential(
-        nn.Linear(10, 10),
-        nn.ReLU(),
-        nn.Linear(10, 10),
-        nn.ReLU(),
-    ).to(device)
+    def build_module():
+        return nn.Sequential(
+            nn.Linear(10, 10),
+            nn.ReLU(),
+            nn.Linear(10, 10),
+            nn.ReLU(),
+        ).to(device)
+
+    module = nn.ModuleList([build_module() for i in range(10)])
 
     # Run model with and without checkpointing and verify gradients are
     # equivalent, regardless of if inputs require grads or not.
@@ -60,8 +64,8 @@ def test_checkpoint(policy_fn, input_requires_grad, device, autocast):
     out_copy = inputs_copy
     with torch.autocast(device_type=device, enabled=autocast):
         for i in range(10):
-            out = checkpoint(module, out, policy_fn=policy_fn)
-            out_copy = module_copy(out_copy)
+            out = checkpoint(module[i], out, policy_fn=policy_fn)
+            out_copy = module_copy[i](out_copy)
 
     assert torch.allclose(out, out_copy)
     out.sum().backward()
@@ -70,7 +74,6 @@ def test_checkpoint(policy_fn, input_requires_grad, device, autocast):
         assert torch.allclose(p.grad, p_copy.grad)
 
 
-@pytest.mark.skipif(torch.__version__ < "2.2", reason="Only new PyTorch supported")
 @pytest.mark.parametrize("policy_fn", [None, [], _relu_policy, _all_policy])
 @pytest.mark.parametrize("input_requires_grad", [True, False])
 @pytest.mark.parametrize("grad_mode", [True, False])
@@ -100,7 +103,6 @@ def test_checkpoint_with_grad(policy_fn, input_requires_grad, grad_mode):
     assert torch.allclose(out, out_copy)
 
 
-@pytest.mark.skipif(torch.__version__ < "2.2", reason="Only new PyTorch supported")
 @cuda_only
 @pytest.mark.parametrize("policy_fn", [None, [], _relu_policy, _all_policy])
 @pytest.mark.parametrize("input_requires_grad", [True, False])
@@ -110,7 +112,11 @@ def test_checkpoint_with_grad(policy_fn, input_requires_grad, grad_mode):
     "op",
     [
         xformers.ops.MemoryEfficientAttentionFlashAttentionOp,
-        xformers.ops.MemoryEfficientAttentionCutlassOp,
+        (
+            xformers.ops.MemoryEfficientAttentionCutlassOp
+            if torch.version.cuda
+            else xformers.ops.MemoryEfficientAttentionCkOp
+        ),
     ],
 )
 def test_checkpoint_attention(policy_fn, input_requires_grad, device, autocast, op):
@@ -119,6 +125,15 @@ def test_checkpoint_attention(policy_fn, input_requires_grad, device, autocast, 
         or op[1].CUDA_MINIMUM_COMPUTE_CAPABILITY > cuda_cap
     ):
         pytest.skip("skipping operator not supported in this arch")
+
+    if (
+        op is xformers.ops.MemoryEfficientAttentionFlashAttentionOp
+        and torch.version.hip
+    ):
+        pytest.skip("FlashAttentionOp is not supported on ROCM!")
+
+    if op is xformers.ops.MemoryEfficientAttentionCkOp:
+        pytest.skip("Gradience is currently not supported by ck-tiled!")
 
     class Attn(nn.Module):
         def forward(self, x):
@@ -224,7 +239,13 @@ def test_optimize_runtime_with_given_memory(max_memory, optimal_soln):
     memory = torch.tensor([x[2] for x in data], dtype=torch.float64)
 
     out = _optimize_runtime_with_given_memory(
-        memory, runtimes, max_memory, view_like_ops, inplace_ops, rand_ops
+        memory,
+        runtimes,
+        max_memory,
+        view_like_ops,
+        inplace_ops,
+        rand_ops,
+        force_store_random=False,
     )
     torch.testing.assert_close(optimal_soln, out)
 
@@ -266,7 +287,6 @@ class _Model(torch.nn.Module):
         return x
 
 
-@pytest.mark.skipif(torch.__version__ < "2.2", reason="Only new PyTorch supported")
 @cuda_only
 @pytest.mark.parametrize("device", ["cuda"])
 @pytest.mark.parametrize("memory_budget", [0, 0.03, 0.05, 0.1, 0.3, 0.5, 0.8, 1.0])
@@ -305,3 +325,57 @@ def test_optimal_checkpoint_policy(
 
     for p, p_ref in zip(model.parameters(), model_ref.parameters()):
         torch.testing.assert_close(p.grad, p_ref.grad)
+
+
+@pytest.mark.skipif(True, reason="TODO[fmassa]: Broken on nightly")
+@cuda_only
+@pytest.mark.parametrize("no_grad", [False, True])
+@pytest.mark.parametrize("device", ["cuda"])
+@pytest.mark.parametrize("memory_budget", [0, 0.1, 0.3, 1.0])
+@pytest.mark.parametrize("inplace", [False])
+@pytest.mark.parametrize("random", [False])
+@torch._dynamo.config.patch(  # type: ignore
+    "_experimental_support_context_fn_in_torch_utils_checkpoint", True
+)
+def test_selective_checkpoint_wrapper_compile(
+    device, no_grad, memory_budget, inplace, random
+):
+    torch.manual_seed(42)
+    dtype = torch.float16
+    modules = _get_model_blocks(
+        3, dtype, device, inplace=inplace, random=random, first_inplace=False
+    )
+    inputs = torch.rand(32, 128, 10, dtype=dtype, device=device)
+
+    model = torch.nn.Sequential(
+        *[selective_checkpoint_wrapper(b, memory_budget=memory_budget) for b in modules]
+    )
+    model = torch.compile(model)
+    model_ref = torch.nn.Sequential(*deepcopy(modules))
+
+    grad = torch.rand_like(inputs)
+
+    context = torch.no_grad() if no_grad else nullcontext()
+
+    with context:
+        torch.manual_seed(42)
+        out = model(inputs.clone())
+        if not no_grad:
+            out.backward(grad)
+
+        torch.manual_seed(42)
+        out_ref = model_ref(inputs.clone())
+        if not no_grad:
+            out_ref.backward(grad)
+
+    atol = 3e-4
+    rtol = 1e-3
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+
+    if no_grad:
+        return
+
+    for p, p_ref in zip(model.parameters(), model_ref.parameters()):
+        atol = 4e-4
+        rtol = 2e-3
+        torch.testing.assert_close(p.grad, p_ref.grad, atol=atol, rtol=rtol)

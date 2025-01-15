@@ -43,17 +43,24 @@ def compute_once(func):
 
 @compute_once
 def _is_triton_available():
+    if os.environ.get("XFORMERS_ENABLE_TRITON", "0") == "1":
+        return True
     if not torch.cuda.is_available():
         return False
     if os.environ.get("XFORMERS_FORCE_DISABLE_TRITON", "0") == "1":
         return False
+    # We have many errors on V100 with recent triton versions
+    # Let's just drop support for triton kernels below A100
+    if torch.cuda.get_device_capability("cuda") < (8, 0):
+        return False
     try:
-        from xformers.triton.softmax import softmax as triton_softmax  # noqa
+        import triton  # noqa
 
         return True
-    except (ImportError, AttributeError) as e:
+    except (ImportError, AttributeError):
         logger.warning(
-            f"A matching Triton is not available, some optimizations will not be enabled.\nError caught was: {e}"
+            "A matching Triton is not available, some optimizations will not be enabled",
+            exc_info=True,
         )
         return False
 

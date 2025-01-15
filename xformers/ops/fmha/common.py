@@ -6,7 +6,18 @@
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, List, Mapping, Optional, Set, Tuple, Type, Union
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 
 import torch
 
@@ -14,9 +25,13 @@ from ..._cpp_lib import _built_with_cuda
 from ..common import BaseOperator
 from .attn_bias import (
     AttentionBias,
+    AttentionBiasSubTensor,
+    BlockDiagonalGappyKeysMask,
     BlockDiagonalMask,
+    BlockDiagonalPaddedKeysMask,
     LowerTriangularMask,
-    LowerTriangularMaskWithTensorBias,
+    PagedBlockDiagonalGappyKeysMask,
+    PagedBlockDiagonalPaddedKeysMask,
 )
 
 
@@ -33,10 +48,8 @@ def _attn_bias_apply(
     attn_bias: Optional[Union[torch.Tensor, AttentionBias]],
     op: Callable[[torch.Tensor], torch.Tensor],
 ) -> Optional[Union[torch.Tensor, AttentionBias]]:
-    if isinstance(attn_bias, torch.Tensor):
+    if isinstance(attn_bias, torch.Tensor) and attn_bias.ndim != 0:
         return op(attn_bias)
-    if isinstance(attn_bias, LowerTriangularMaskWithTensorBias):
-        return LowerTriangularMaskWithTensorBias(op(attn_bias._bias))
     return attn_bias
 
 
@@ -52,6 +65,8 @@ class Inputs:
     attn_bias: Optional[Union[torch.Tensor, AttentionBias]] = None
     p: float = 0.0
     scale: Optional[float] = None
+    output_dtype: Optional[torch.dtype] = None
+    is_partial: bool = False
 
     @property
     def device(self) -> torch.device:
@@ -108,13 +123,31 @@ class Inputs:
             x.ndim != self.query.ndim for x in qkv
         ):
             raise ValueError(
-                f"Query/Key/Value should all have BMGHK, BMHK, or BMK shape.\n"
+                f"Query/Key/Value should all have BMGHK, BMHK or BMK shape.\n"
                 f"  query.shape: {self.query.shape}\n"
                 f"  key.shape  : {self.key.shape}\n"
                 f"  value.shape: {self.value.shape}"
             )
         if any(x.device != self.query.device for x in qkv):
             raise ValueError("Query/Key/Value should all be on the same device")
+        if isinstance(
+            self.attn_bias,
+            (
+                BlockDiagonalMask,
+                BlockDiagonalPaddedKeysMask,
+                PagedBlockDiagonalPaddedKeysMask,
+                BlockDiagonalGappyKeysMask,
+                PagedBlockDiagonalGappyKeysMask,
+            ),
+        ):
+            bias_device = self.attn_bias.q_seqinfo.seqstart.device
+            if bias_device != self.query.device:
+                raise ValueError(
+                    f"Attention bias and Query/Key/Value should be on the same device\n"
+                    f"  query.device: {self.query.device}\n"
+                    f"  attn_bias   : {bias_device}\n"
+                )
+
         quantized_dtypes = self.key.dtype == self.value.dtype == torch.int32
         non_quantized_dtypes = all(x.dtype == self.query.dtype for x in qkv)
         if not (quantized_dtypes or non_quantized_dtypes):
@@ -136,10 +169,11 @@ class Inputs:
                 f"than BMK when using bias type `{type(self.attn_bias).__name__}`"
             )
         attn_bias_t: Optional[torch.Tensor] = None
-        if isinstance(self.attn_bias, torch.Tensor):
+        if isinstance(self.attn_bias, AttentionBiasSubTensor):
+            if self.attn_bias.HOLDS_DENSE_TENSOR:
+                attn_bias_t = self.attn_bias._subtensor
+        elif isinstance(self.attn_bias, torch.Tensor):
             attn_bias_t = self.attn_bias
-        if isinstance(self.attn_bias, LowerTriangularMaskWithTensorBias):
-            attn_bias_t = self.attn_bias._bias
         if self.query.ndim == 4 and attn_bias_t is not None:
             expected_shape = (
                 self.query.shape[0],
@@ -203,13 +237,32 @@ class Inputs:
                 "yourself before calling `memory_efficient_attention` if you need to"
             )
 
+    def get_output_dtype(self) -> torch.dtype:
+        if self.output_dtype is None:
+            if self.is_partial and self.query.dtype is not torch.float64:
+                return torch.float32
+            return self.query.dtype
+        return self.output_dtype
+
+    @property
+    def nbytes(self) -> int:
+        """
+        Number of bytes in the input, not counting the attention bias.
+        """
+        return sum(
+            x.untyped_storage().nbytes() for x in [self.query, self.key, self.value]
+        )
+
 
 @dataclass
 class Context:
     lse: torch.Tensor
     out: torch.Tensor
+    # NOTE: If `rng_state` is set, `op_bw` should be set as well
+    # as the randomness is backend-dependant
     op_bw: Optional[Type["AttentionBwOpBase"]] = None
-    rng_state: Optional[torch.Tensor] = None
+    rng_state: Optional[Any] = None
+    qkv_share_storage: bool = False
 
     def get_padded_lse(self, pad_to: int, force_pad_inf: bool = False) -> torch.Tensor:
         pad_amount = (pad_to - (self.lse.shape[2] % pad_to)) % pad_to
@@ -244,8 +297,6 @@ class AttentionOpBase(BaseOperator):
     - :attr:`xformers.ops.fmha.flash.BwOp`
     - :attr:`xformers.ops.fmha.triton.FwOp`
     - :attr:`xformers.ops.fmha.triton.BwOp`
-    - :attr:`xformers.ops.fmha.small_k.FwOp`
-    - :attr:`xformers.ops.fmha.small_k.BwOp`
     """
 
     OPERATOR: Any
@@ -253,14 +304,22 @@ class AttentionOpBase(BaseOperator):
     CUDA_MINIMUM_COMPUTE_CAPABILITY: Tuple[int, int] = (5, 0)
     SUPPORTED_DTYPES: Set[torch.dtype]
     SUPPORTED_MAX_K: float
-    SUPPORTED_ATTN_BIAS_TYPES: Set[Any] = {type(None)}
+    SUPPORTED_MIN_K: int = 0
+    SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (type(None),)
     SUPPORTS_DROPOUT: bool
     SUPPORTS_CUSTOM_SCALE: bool = False
     SUPPORTS_DIFFERENT_VALUE_EMBED: bool = False
+    SUPPORTS_OUTPUT_DTYPE: bool = False
+    SUPPORTS_PARTIAL: bool = False
     IS_DETERMINISTIC: bool = True
     SUPPORTS_BMGHK: bool = False
     NAME: str
     OPERATOR_CATEGORY = "memory_efficient_attention"
+    # Format for the LSE computed in the FW pass, and accepted in the BW pass,
+    # for BlockDiagonalMask and children.
+    # When using a varlen bias, both the FW and BW operators must have the
+    # same value for `VARLEN_LSE_PACKED`
+    VARLEN_LSE_PACKED: bool = True
 
     _TEST_BATCH_SIZES: List[int] = [1, 300]
     _TEST_K: List[int] = [32, 128]
@@ -278,7 +337,11 @@ class AttentionOpBase(BaseOperator):
             reasons.append("query.shape[-1] != value.shape[-1]")
         if max(K, Kv) > cls.SUPPORTED_MAX_K:
             reasons.append(
-                f"max(query.shape[-1] != value.shape[-1]) > {cls.SUPPORTED_MAX_K}"
+                f"max(query.shape[-1], value.shape[-1]) > {cls.SUPPORTED_MAX_K}"
+            )
+        if min(K, Kv) < cls.SUPPORTED_MIN_K:
+            reasons.append(
+                f"min(query.shape[-1], value.shape[-1]) < {cls.SUPPORTED_MIN_K}"
             )
         return reasons
 
@@ -288,19 +351,24 @@ class AttentionOpBase(BaseOperator):
         Returns a list of reasons why this is not supported.
         The kernel can run these inputs only if the returned list is empty
         """
+        query_shape = d.query.shape
         reasons = cls.shape_not_supported_reasons(
-            Mq=d.query.shape[1],
+            Mq=query_shape[1],
             Mkv=d.key.shape[1],
-            K=d.query.shape[-1],
-            Kv=d.value.shape[-1],
+            K=query_shape[-1],
+            Kv=query_shape[-1] if d.value.dtype == torch.int32 else d.value.shape[-1],
         )
         device_type = d.query.device.type
         dtype = d.query.dtype
         if device_type not in cls.SUPPORTED_DEVICES:
             reasons.append(f"device={device_type} (supported: {cls.SUPPORTED_DEVICES})")
-        if device_type == "cuda" and not _built_with_cuda:
+        if (
+            device_type == "cuda"
+            and not _built_with_cuda
+            and (torch.version.hip is None)
+        ):
             reasons.append("xFormers wasn't build with CUDA support")
-        if device_type == "cuda":
+        if device_type == "cuda" and (torch.version.hip is None):
             device_capability = torch.cuda.get_device_capability(d.device)
             if device_capability < cls.CUDA_MINIMUM_COMPUTE_CAPABILITY:
                 reasons.append(
@@ -311,6 +379,11 @@ class AttentionOpBase(BaseOperator):
             reasons.append(f"dtype={dtype} (supported: {cls.SUPPORTED_DTYPES})")
         if type(d.attn_bias) not in cls.SUPPORTED_ATTN_BIAS_TYPES:
             reasons.append(f"attn_bias type is {type(d.attn_bias)}")
+        if not cls.SUPPORTS_OUTPUT_DTYPE:
+            if d.output_dtype is not None and d.output_dtype is not dtype:
+                reasons.append("Custom output dtype not supported")
+        if d.is_partial and not cls.SUPPORTS_PARTIAL:
+            reasons.append("Partial attention not supported")
         if (d.p != 0.0) and not cls.SUPPORTS_DROPOUT:
             reasons.append("dropout > 0.0")
         if d.scale is not None and not cls.SUPPORTS_CUSTOM_SCALE:
@@ -354,49 +427,6 @@ class AttentionFwOpBase(AttentionOpBase):
     ) -> Tuple[torch.Tensor, Optional[Context]]:
         raise NotImplementedError()
 
-    @classmethod
-    def attn_operator_flop(
-        cls,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        causal: bool = False,
-        seqstart_k: Optional[torch.Tensor] = None,
-        seqstart_q: Optional[torch.Tensor] = None,
-    ) -> int:
-        """
-        Computes total flops for the attention
-        Assumes inputs in format BMHK
-        """
-        assert query.ndim == 4
-
-        if seqstart_q is not None:
-            seqstart_q_py = seqstart_q.tolist()
-        else:
-            seqstart_q_py = [0, query.shape[1]]
-        if seqstart_k is not None:
-            seqstart_k_py = seqstart_k.tolist()
-        else:
-            seqstart_k_py = [0, key.shape[1]]
-
-        total_flop = 0
-        for q_start, q_end, k_start, k_end in zip(
-            seqstart_q_py, seqstart_q_py[1:], seqstart_k_py, seqstart_k_py[1:]
-        ):
-            num_q = q_end - q_start
-            num_kv = k_end - k_start
-            # (M,K) @ (K,N) GEMM needs M*N*K*2 flop
-            # Q @ K.transpose
-            total_flop += num_q * num_kv * query.shape[-1] * 2
-            # (ignore softmax)
-            # attn @ V
-            total_flop += num_q * key.shape[-1] * num_kv * 2
-        # Multiply by num_heads and batches
-        total_flop = total_flop * value.shape[2] * value.shape[0]
-        if causal:
-            total_flop //= 2
-        return total_flop
-
 
 class AttentionBwOpBase(AttentionOpBase):
     # NOTE on tolerances: These are tested for `scales => (1/32)**0.5`
@@ -406,7 +436,7 @@ class AttentionBwOpBase(AttentionOpBase):
 
     ERROR_ATOL: Mapping[torch.dtype, float] = {
         torch.float: 9e-4,
-        torch.half: 0.1,
+        torch.half: 0.2,
         torch.bfloat16: 0.9,
     }
     ERROR_RTOL: Mapping[torch.dtype, float] = {
@@ -415,6 +445,7 @@ class AttentionBwOpBase(AttentionOpBase):
         torch.bfloat16: 0.1,
     }
     SUPPORTS_ATTN_BIAS_GRAD = False
+    SUPPORTS_PARTIAL = True
 
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
@@ -434,96 +465,10 @@ class AttentionBwOpBase(AttentionOpBase):
     def apply(cls, ctx: Context, inp: Inputs, grad: torch.Tensor) -> Gradients:
         raise NotImplementedError()
 
-    @classmethod
-    def attn_operator_flop(
-        cls,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        causal: bool = False,
-        seqstart_k: Optional[torch.Tensor] = None,
-        seqstart_q: Optional[torch.Tensor] = None,
-    ) -> int:
-        """
-        Computes total flops for the attention
-        Assumes inputs in format BMHK
-        """
-        assert query.ndim == 4
-
-        if seqstart_q is not None:
-            seqstart_q_py = seqstart_q.tolist()
-        else:
-            seqstart_q_py = [0, query.shape[1]]
-        if seqstart_k is not None:
-            seqstart_k_py = seqstart_k.tolist()
-        else:
-            seqstart_k_py = [0, key.shape[1]]
-
-        total_flop = 0
-        for q_start, q_end, k_start, k_end in zip(
-            seqstart_q_py, seqstart_q_py[1:], seqstart_k_py, seqstart_k_py[1:]
-        ):
-            num_q = q_end - q_start
-            num_kv = k_end - k_start
-            Kqk = query.shape[-1]
-            Kv = value.shape[-1]
-            # (M,K) @ (K,N) GEMM needs M*N*K*2 flop
-            # att = Q @ K.transpose
-            total_flop += num_q * num_kv * Kqk * 2
-            # att @ dO
-            total_flop += num_kv * num_q * Kv * 2
-            # dov = dO @ V
-            total_flop += num_q * Kv * num_kv * 2
-            # dov @ K
-            total_flop += num_q * Kqk * num_kv * 2
-            # dov @ Q
-            total_flop += num_q * Kqk * num_kv * 2
-        # Multiply by num_heads and batches
-        total_flop = total_flop * value.shape[2] * value.shape[0]
-        if causal:
-            total_flop //= 2
-        return total_flop
-
 
 AttentionOp = Tuple[
     Optional[Type[AttentionFwOpBase]], Optional[Type[AttentionBwOpBase]]
 ]
-
-
-@dataclass
-class AttentionOpDispatch:
-    """Dispatcher to automatically select
-    the best operator to run memory-efficient attention.
-
-    :Deprecated:
-
-        This class is deprecated and will be removed in a later version
-    """
-
-    op: AttentionOp
-
-    @classmethod
-    def from_arguments(
-        cls,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_bias: Optional[Union[torch.Tensor, AttentionBias]] = None,
-        p: float = 0.0,
-        scale: Optional[float] = None,
-    ) -> "AttentionOpDispatch":
-        """Here for backward compatibility"""
-        from .dispatch import _dispatch_bw, _dispatch_fw
-
-        inp = Inputs(
-            query=query,
-            key=key,
-            value=value,
-            attn_bias=attn_bias,
-            p=p,
-            scale=scale,
-        )
-        return AttentionOpDispatch(op=(_dispatch_fw(inp, True), _dispatch_bw(inp)))
 
 
 def bmk2bmhk(tensor, num_heads: int) -> torch.Tensor:

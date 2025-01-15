@@ -7,7 +7,6 @@
 import functools
 import time
 from collections import defaultdict
-from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import astuple, dataclass
 from typing import Any, Callable, ContextManager, Dict, List, Optional, Tuple
@@ -29,6 +28,7 @@ try:
 except ImportError:
     _scipy_is_available = False
 
+
 try:
     # let's keep BC for older PyTorch for now
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -37,7 +37,6 @@ try:
     from torch.utils.checkpoint import (  # type: ignore
         _CachedTorchDispatchMode,
         _CachingTorchDispatchMode,
-        _ignored_ops,
     )
 except ImportError:
     ActivationWrapper = torch.nn.Module  # type: ignore
@@ -48,12 +47,22 @@ except ImportError:
 
     _CachedTorchDispatchMode = _NotAvailable  # type: ignore
     _CachingTorchDispatchMode = _NotAvailable  # type: ignore
-    _ignored_ops = set()  # type: ignore
+
+
+try:
+    from torch.utils.checkpoint import SAC_IGNORED_OPS as _ignored_ops  # type: ignore
+
+    _PT_HAS_NEW_IMPL = True
+except ImportError:
+    from torch.utils.checkpoint import _ignored_ops  # type: ignore
+
+    _PT_HAS_NEW_IMPL = False
 
 
 _additional_ignored_ops = {
     torch.ops.aten.lift_fresh.default,
     torch.ops.profiler._record_function_exit._RecordFunction,
+    torch.ops.aten.clone.default,  # seems needed for torch.compile
 }
 OPS_TO_ALWAYS_SKIP = _ignored_ops | _additional_ignored_ops
 
@@ -70,12 +79,6 @@ class ProfileMetadata:
     is_rand_op: bool
 
 
-def _detach(x):
-    if isinstance(x, torch.Tensor):
-        return x.detach()
-    return x
-
-
 def _get_default_policy(allow_list=None):
     _default_allow_list = [
         "xformers.efficient_attention_forward_cutlass.default",
@@ -86,7 +89,7 @@ def _get_default_policy(allow_list=None):
     if allow_list is None:
         allow_list = _default_allow_list
 
-    def _default_policy(func, *args, **kwargs):
+    def _default_policy(ctx, func, *args, **kwargs):
         return str(func) in allow_list
 
     return _default_policy
@@ -115,11 +118,26 @@ def list_operators(function, *args, **kwargs):
 
 
 class CachedTorchDispatchMode(_CachedTorchDispatchMode):
+    def __init__(self, policy_fn, storage, allow_cache_entry_mutation):
+        global _PT_HAS_NEW_IMPL
+        if _PT_HAS_NEW_IMPL:
+            super().__init__(policy_fn, storage, allow_cache_entry_mutation)
+        else:
+            super().__init__(policy_fn, storage)
+
+    # this is here for the old implementations
     def pop_from_storage(self, func, args, kwargs):
         # the autograd engine might add spurious views. This is a basic
         # guard and should be improved
         if self.storage[func]:
             return self.storage[func].pop(0)
+        return func(*args, **kwargs)
+
+
+class NullTorchDispatchMode(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
         return func(*args, **kwargs)
 
 
@@ -148,8 +166,8 @@ def selective_checkpoint_context_fn(policy_fn=None):
     if torch.is_grad_enabled():
         caching_mode = _CachingTorchDispatchMode(deepcopy(policy_fn), temp_storage)
     else:
-        caching_mode = nullcontext()
-    cached_mode = CachedTorchDispatchMode(deepcopy(policy_fn), temp_storage)
+        caching_mode = NullTorchDispatchMode()
+    cached_mode = CachedTorchDispatchMode(deepcopy(policy_fn), temp_storage, True)
 
     return caching_mode, cached_mode
 
@@ -182,6 +200,7 @@ def checkpoint(
         function,
         *args,
         use_reentrant=False,
+        preserve_rng_state=preserve_rng_state,
         context_fn=functools.partial(selective_checkpoint_context_fn, policy_fn),
         **kwargs,
     )
@@ -231,6 +250,10 @@ class ProfileOperatorsTorchDispatchMode(TorchDispatchMode):
         curr_idx, output_ids, inplace_info = self._get_inplace_metadata(func, out)
         is_view_like = is_view_fn(func) or is_inplace_view_fn(func)
         is_rand_op = torch.Tag.nondeterministic_seeded in func.tags
+        # sdpa has non-deterministic seed, but might be deterministic
+        # if no dropout is applied
+        if func.overloadpacket.__name__ == "_scaled_dot_product_flash_attention":
+            is_rand_op = kwargs.get("dropout_p", 0) != 0
 
         # get runtime info of func
         torch.cuda.synchronize()
@@ -345,6 +368,9 @@ def get_optimal_checkpoint_policy(function, *args, memory_budget: float) -> Call
 
     max_memory = memory_budget * memory.sum().item()
 
+    # workaround to fix https://github.com/pytorch/pytorch/issues/121212
+    force_store_random = all([not isinstance(x, torch.Tensor) for x in args])
+
     optim_output = _optimize_runtime_with_given_memory(
         memory=memory,
         runtimes=runtimes,
@@ -352,6 +378,7 @@ def get_optimal_checkpoint_policy(function, *args, memory_budget: float) -> Call
         view_like_ops=view_like_ops,
         inplace_ops=inplace_ops,
         random_ops=rand_ops,
+        force_store_random=force_store_random,
     )
     return _OptimalPolicy(optim_output=optim_output)
 
@@ -363,6 +390,7 @@ def _optimize_runtime_with_given_memory(
     view_like_ops: List[int],
     inplace_ops: List[Tuple[int, ...]],
     random_ops: List[int],
+    force_store_random: bool,
 ) -> torch.Tensor:
     """
     Given a list of operator names, their corresponding runtimes, and the maximum amount of memory available,
@@ -378,6 +406,7 @@ def _optimize_runtime_with_given_memory(
             This will be used to add the constraint that in-place ops need to either be
             stored in memory with the previous op, or recomputed with the previous op.
         random_ops ([List[int]): Indices of the random ops, which will always be recomputed.
+        force_store_random (bool): force random ops to always be stored (instead of recomputed)
     """
     c = -runtimes  # type: ignore[operator]
 
@@ -390,7 +419,7 @@ def _optimize_runtime_with_given_memory(
         A[i] = 1
         constraints.append(LinearConstraint(A=A, lb=0, ub=0))
 
-    # inplace ops should always be done in conjuction with its parent op
+    # inplace ops should always be done in conjunction with its parent op
     # i.e., if we recompute the parent op the inplace should also be
     # recomputed, and vice versa
     for op, op_parent in inplace_ops:
@@ -405,16 +434,26 @@ def _optimize_runtime_with_given_memory(
             A[op] = 1
             constraints.append(LinearConstraint(A=A, lb=1, ub=1))
 
-    # random ops should always be recomputed
+    # ideally, always recompute random ops
+    # in practice, due to a bug in https://github.com/pytorch/pytorch/issues/121212
+    # sometimes we need to store them to avoid correctness issues
     for i in random_ops:
         A = torch.zeros_like(c)
         A[i] = 1
-        constraints.append(LinearConstraint(A=A, lb=0, ub=0))
+        val = int(force_store_random)
+        constraints.append(LinearConstraint(A=A, lb=val, ub=val))
 
     integrality = torch.ones_like(c)
     res = milp(
         c=c, constraints=constraints, integrality=integrality, bounds=Bounds(0, 1)
     )
+    if not res.success:
+        raise ValueError(
+            "The problem is infeasible, and probably due to a change in xformers "
+            "that makes random ops always be stored. Try passing a larger memory_budget. "
+            "This will be fixed once https://github.com/pytorch/pytorch/issues/121212 "
+            "is solved"
+        )
     x = torch.from_numpy(res.x)
     return x
 
@@ -424,7 +463,7 @@ class _OptimalPolicy:
         self.counter = 0
         self.optim_output = optim_output.tolist()
 
-    def __call__(self, mode, func, *args, **kwargs) -> bool:
+    def __call__(self, ctx, func, *args, **kwargs) -> bool:
         # returning False means recompute, True means store in memory
         if func in OPS_TO_ALWAYS_SKIP:
             return False
@@ -435,36 +474,53 @@ class _OptimalPolicy:
 
 class SelectiveCheckpointWrapper(ActivationWrapper):
     def __init__(self, mod, memory_budget=None, policy_fn=None):
-        if torch.__version__ < (2, 1):
-            raise RuntimeError(
-                "SelectiveCheckpointWrapper only supported for torch >- 2.1"
-            )
         super().__init__(mod)
         if not ((memory_budget is None) ^ (policy_fn is None)):
             raise ValueError("Need to specify either policy_fn or memory_budget")
         self.memory_budget = memory_budget
         self.policy_fn = policy_fn
 
-    def forward(self, *args, **kwargs):
-        if self.policy_fn is None:
-            # if policy is not specified, initialize policy for a given memory budget
-            self.policy_fn = get_optimal_checkpoint_policy(
+        try:
+            # for backward-compatibility as this doesn't exist in PT anymore
+            torch._dynamo.config._experimental_support_context_fn_in_torch_utils_checkpoint = (
+                True
+            )
+        except AttributeError:
+            pass
+
+    @torch.compiler.disable
+    def _get_policy_fn(self, *args, **kwargs):
+        if not torch.is_grad_enabled():
+            # no need to compute a policy as it won't be used
+            return []
+        # if policy is not specified, initialize policy for a given memory budget
+        with torch.random.fork_rng():
+            policy_fn = get_optimal_checkpoint_policy(
                 self._checkpoint_wrapped_module,
                 *args,
                 **kwargs,
                 memory_budget=self.memory_budget,
             )
-            if (
-                torch.distributed.is_available()
-                and torch.distributed.is_initialized()
-                and torch.distributed.get_world_size() > 1
-            ):
-                # use the same policy across different GPUs
-                objects = [self.policy_fn]
-                torch.distributed.broadcast_object_list(objects, src=0)
-                self.policy_fn = objects[0]
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            # use the same policy across different GPUs
+            objects = [policy_fn]
+            torch.distributed.broadcast_object_list(objects, src=0)
+            policy_fn = objects[0]
+        return policy_fn
+
+    def get_policy_fn(self, *args, **kwargs):
+        if self.policy_fn is None:
+            self.policy_fn = self._get_policy_fn(*args, **kwargs)
+        return self.policy_fn
+
+    def forward(self, *args, **kwargs):
+        policy_fn = self.get_policy_fn(*args, **kwargs)
         return checkpoint(
-            self._checkpoint_wrapped_module, *args, **kwargs, policy_fn=self.policy_fn
+            self._checkpoint_wrapped_module, *args, **kwargs, policy_fn=policy_fn
         )
 
 

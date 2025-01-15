@@ -22,7 +22,15 @@ def rope_padded(
     attn_bias: BlockDiagonalCausalWithOffsetPaddedKeysMask,
     *,
     theta: float = 10000.0,
+    linear_scale: float = 1.0,
+    use_dynamic_scaling: bool = False,
+    dynamic_old_context_len: float = 8192.0,
+    dynamic_scale_factor: float = 16.0,
+    dynamic_low_freq_factor: float = 1.0,
+    dynamic_high_freq_factor: float = 32.0,
     out_q: Optional[torch.Tensor] = None,
+    first_seqpos: Optional[torch.Tensor] = None,
+    seqpos: Optional[torch.Tensor] = None,
     adjacents: bool = True,
     internal_dtype: str = "",
 ):
@@ -57,6 +65,15 @@ def rope_padded(
                 Used to determine frequencies for the
                 RoPE calculation as well as the locations in cache_k and cache_v
                 to write to. Must be on the device.
+        first_seqpos: Optionally a tensor containing the sequence position of the
+                    beginning of the cache for each batch element.
+                    Providing a tensor of zeros is the same as providing None.
+                    This affects the numerical calculation but not which memory
+                    locations are read or written.
+        seqpos: Optionally a 1D tensor containing the sequence position of each
+                    query. This should have length equal to xq.shape[1] .
+                    This affects the numerical calculation but not which memory
+                    locations are read or written.
         adjacents: If True, the inputs are in adjacent pairs along the final dim axis.
                   This is like the released LLaMA model.
                   If False, the dim axis is split in two equal pieces.
@@ -65,6 +82,15 @@ def rope_padded(
                    https://github.com/huggingface/transformers/blob/
                    f143037789288ba532dada934a118e648e715738/
                    src/transformers/models/llama/modeling_llama.py#L126-L130
+        linear_scale: A scaling factor to apply to the sequence ids when computing
+                      the RoPE frequencies.  When set to K, all sequence indices
+                      are divided by K.
+        use_dynamic_scaling: If true, dynamic scaling in use, using a scaling like
+            “YaRN: Efficient Context Window Extension of Large Language Models”
+        dynamic_old_context_len: used with use_dynamic_scaling
+        dynamic_scale_factor: used with use_dynamic_scaling
+        dynamic_low_freq_factor: used with use_dynamic_scaling
+        dynamic_high_freq_factor: used with use_dynamic_scaling
         internal_dtype: set to "f32" or "f64" to enforce dtype in the calculation
     """
     if torch.is_grad_enabled() and (
@@ -107,9 +133,13 @@ def rope_padded(
         bsz, q_len, n_q_heads, dim = xq.shape
         assert q_len == n_total_queries
         if xk_shape != (1, n_total_queries, expected_kv_heads, dim):
-            raise ValueError("unexpected k shape")
+            raise ValueError(
+                f"unexpected k shape {xk_shape}: expected {(1, n_total_queries, expected_kv_heads, dim)}"
+            )
         if xv.shape != (1, n_total_queries, expected_kv_heads, dim):
-            raise ValueError("unexpected v shape")
+            raise ValueError(
+                f"unexpected v shape {xv.shape}: expected {(1, n_total_queries, expected_kv_heads, dim)}"
+            )
         if cache_k_shape != (1, cache_length, expected_cache_heads, dim):
             raise ValueError("unexpected cache_k shape")
         if cache_v.shape != (1, cache_length, expected_cache_heads, dim):
@@ -121,13 +151,23 @@ def rope_padded(
         bsz, q_len, n_groups, n_q_heads, dim = xq.shape
         assert q_len == n_total_queries
         if xk_shape != (1, n_total_queries, n_groups, expected_kv_heads, dim):
-            raise ValueError("unexpected k shape")
+            raise ValueError(
+                f"unexpected k shape {xk_shape}: expected {(1, n_total_queries, n_groups, expected_kv_heads, dim)}"
+            )
         if xv.shape != (1, n_total_queries, n_groups, expected_kv_heads, dim):
-            raise ValueError("unexpected v shape")
+            raise ValueError(
+                f"unexpected v shape {xv.shape}: expected {(1, n_total_queries, n_groups, expected_kv_heads, dim)}"
+            )
         if cache_k_shape != (1, cache_length, n_groups, expected_cache_heads, dim):
-            raise ValueError("unexpected cache_k shape")
+            raise ValueError(
+                f"unexpected cache_k shape {cache_k_shape}: "
+                f"expected {(1, cache_length, n_groups, expected_cache_heads, dim)}"
+            )
         if cache_v.shape != (1, cache_length, n_groups, expected_cache_heads, dim):
-            raise ValueError("unexpected cache_v shape")
+            raise ValueError(
+                f"unexpected cache_v shape {cache_v.shape}: "
+                f"expected {(1, cache_length, n_groups, expected_cache_heads, dim)}"
+            )
         out_q_stride = (
             0,
             n_q_heads * dim * n_groups,
@@ -166,6 +206,22 @@ def rope_padded(
 
     logical_bsz = len(attn_bias.q_seqinfo.seqstart_py) - 1
 
+    if first_seqpos is not None and seqpos is not None:
+        raise ValueError("seqpos and first_seqpos may not both be provided")
+    stride_seqpos = 0
+    if first_seqpos is not None:
+        if first_seqpos.shape != (logical_bsz,):
+            shape = tuple(first_seqpos.shape)
+            raise ValueError(
+                f"first_seqpos.shape {shape} but ({logical_bsz},) expected."
+            )
+        stride_seqpos = first_seqpos.stride(0)
+    elif seqpos is not None:
+        if seqpos.shape != (n_total_queries,):
+            shape = tuple(seqpos.shape)
+            raise ValueError(f"seqpos.shape {shape} but ({n_total_queries},) expected.")
+        stride_seqpos = seqpos.stride(0)
+
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // xq.element_size()
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(dim))
@@ -174,58 +230,71 @@ def rope_padded(
     # heuristics for number of warps
     num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
     device = xq.device
-    # Move these to the right device, like fmha does.
-    attn_bias.k_seqinfo.to(device)
-    attn_bias.q_seqinfo.to(device)
     seqstartq = attn_bias.q_seqinfo.seqstart
     seqstartk = attn_bias.k_seqinfo.seqstart
     seqlenk = attn_bias.k_seqinfo.seqlen
+    if (
+        seqstartq.device != device
+        or seqstartk.device != device
+        or seqlenk.device != device
+    ):
+        raise ValueError("`attn_bias` must be on the same device as the other inputs")
     assert internal_dtype in ["", "f32", "f64"]
     # experiment with the order of dims here.
-    _rope_padded_kernel[
-        (logical_bsz, attn_bias.q_seqinfo.max_seqlen, n_total_heads * n_groups)
-    ](
-        xq,
-        xk,
-        xv,
-        out_q,
-        cache_k,
-        cache_v,
-        seqstartq,
-        seqstartk,
-        seqlenk,
-        theta,
-        k_start,
-        v_start,
-        n_groups,
-        dim,
-        xq_stride[1],
-        xq_stride[2] if ndim == 5 else 0,
-        xq_stride[-2],
-        xk_stride[1],
-        xk_stride[2] if ndim == 5 else 0,
-        xk_stride[-2],
-        xv_stride[1],
-        xv_stride[2] if ndim == 5 else 0,
-        xv_stride[-2],
-        cache_k_stride[1],
-        cache_k_stride[2] if ndim == 5 else 0,
-        cache_k_stride[-2],
-        cache_v_stride[1],
-        cache_v_stride[2] if ndim == 5 else 0,
-        cache_v_stride[-2],
-        seqstartq.stride(0),
-        seqstartk.stride(0),
-        seqlenk.stride(0),
-        out_q_stride[1],
-        out_q_stride[2] if ndim == 5 else 0,
-        out_q_stride[-2],
-        internal_dtype,
-        const_batch_strides=False,
-        cache_padding_length=0,
-        seqlenk_shift=0,
-        BLOCK_SIZE=BLOCK_SIZE,
-        adjacents=adjacents,
-        num_warps=num_warps,
-    )
+    with torch.cuda.device(xq.device):
+        _rope_padded_kernel[
+            (attn_bias.q_seqinfo.max_seqlen, logical_bsz, n_total_heads * n_groups)
+        ](
+            xq,
+            xk,
+            xv,
+            out_q,
+            cache_k,
+            cache_v,
+            seqstartq,
+            seqstartk,
+            seqlenk,
+            theta,
+            linear_scale,
+            use_dynamic_scaling,
+            dynamic_old_context_len if use_dynamic_scaling else 0,
+            dynamic_scale_factor if use_dynamic_scaling else 0,
+            dynamic_low_freq_factor if use_dynamic_scaling else 0,
+            dynamic_high_freq_factor if use_dynamic_scaling else 0,
+            first_seqpos,
+            seqpos,
+            k_start,
+            v_start,
+            n_groups,
+            dim,
+            xq_stride[1],
+            xq_stride[2] if ndim == 5 else 0,
+            xq_stride[-2],
+            xk_stride[1],
+            xk_stride[2] if ndim == 5 else 0,
+            xk_stride[-2],
+            xv_stride[1],
+            xv_stride[2] if ndim == 5 else 0,
+            xv_stride[-2],
+            cache_k_stride[1],
+            cache_k_stride[2] if ndim == 5 else 0,
+            cache_k_stride[-2],
+            cache_v_stride[1],
+            cache_v_stride[2] if ndim == 5 else 0,
+            cache_v_stride[-2],
+            seqstartq.stride(0),
+            seqstartk.stride(0),
+            seqlenk.stride(0),
+            out_q_stride[1],
+            out_q_stride[2] if ndim == 5 else 0,
+            out_q_stride[-2],
+            stride_seqpos,
+            internal_dtype,
+            const_batch_strides=False,
+            cache_padding_length=0,
+            seqlenk_shift=0,
+            BLOCK_SIZE=BLOCK_SIZE,
+            adjacents=adjacents,
+            num_warps=num_warps,
+        )
     return out_q

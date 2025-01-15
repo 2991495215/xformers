@@ -5,10 +5,13 @@
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-if hasattr(tl, "libdevice"):
-    tl_math = tl.libdevice
-else:
-    tl_math = tl.math
+try:
+    from triton.language.extra.cuda.libdevice import pow
+except ImportError:
+    try:
+        from triton.language.math import pow
+    except ImportError:
+        from triton.language.libdevice import pow
 
 
 @triton.jit
@@ -23,6 +26,14 @@ def _rope_padded_kernel(
     seqstartk,
     seqlenk,
     theta,
+    linear_scale,
+    use_dynamic_scaling: tl.constexpr,
+    dynamic_old_context_len: tl.constexpr,
+    dynamic_scale_factor: tl.constexpr,
+    dynamic_low_freq_factor: tl.constexpr,
+    dynamic_high_freq_factor: tl.constexpr,
+    first_seqpos,
+    seqpos,
     k_start: tl.constexpr,
     v_start: tl.constexpr,
     n_groups,
@@ -48,6 +59,7 @@ def _rope_padded_kernel(
     stride_outqM,
     stride_outqG,
     stride_outqH,
+    stride_seqpos,
     internal_dtype: tl.constexpr,
     # If True, seqstartq and seqstartk are not used but rather we
     # assume that every batch element has the same number of
@@ -88,8 +100,8 @@ def _rope_padded_kernel(
     Output is to out_q (same shape as xq), an xk-shaped part
     of cache_k and an xv-shaped part of cache_v
     """
-    batch_elt = tl.program_id(0)
-    query_pos_in_batch_elt = tl.program_id(1)
+    query_pos_in_batch_elt = tl.program_id(0)
+    batch_elt = tl.program_id(1)
     group_head_idx = tl.program_id(2)
     group_idx = group_head_idx % n_groups
     head_idx = group_head_idx // n_groups
@@ -127,7 +139,12 @@ def _rope_padded_kernel(
     )
 
     cache_pos = end_of_batch_elt_cache - (end_query_pos - query_pos)
-    seq_pos = cache_pos - cache_start
+    if seqpos is not None:
+        seq_pos = tl.load(seqpos + query_pos * stride_seqpos)
+    else:
+        seq_pos = cache_pos - cache_start
+        if first_seqpos is not None:
+            seq_pos += tl.load(first_seqpos + batch_elt * stride_seqpos)
     cache_k += (
         (head_idx - k_start) * stride_cachekH
         + cache_pos * stride_cachekM
@@ -170,7 +187,28 @@ def _rope_padded_kernel(
         re_x = tl.load(x_in + cols_re, mask=mask)
         im_x = tl.load(x_in + cols_im, mask=mask)
         # freqs = seq_pos / (theta ** (powers / dim))
-        freqs = seq_pos * tl_math.pow(theta, powers / (-dim))
+        freqs = pow(theta, powers / (-dim))
+
+        if use_dynamic_scaling:
+            lo_freq_wavelen = dynamic_old_context_len / dynamic_low_freq_factor
+            hi_freq_wavelen = dynamic_old_context_len / dynamic_high_freq_factor
+
+            wavelens = 6.28318530718 / freqs  # 2*pi
+            is_low_freq = wavelens > lo_freq_wavelen
+            freqs = tl.where(is_low_freq, freqs / dynamic_scale_factor, freqs)
+
+            is_mid_freq = hi_freq_wavelen < wavelens and wavelens <= lo_freq_wavelen
+
+            smooth = (dynamic_old_context_len / wavelens - dynamic_low_freq_factor) / (
+                dynamic_high_freq_factor - dynamic_low_freq_factor
+            )
+            freqs = tl.where(
+                is_mid_freq,
+                (1 - smooth) * freqs / dynamic_scale_factor + smooth * freqs,
+                freqs,
+            )
+
+        freqs = seq_pos * freqs / linear_scale
         sines = tl.sin(freqs)
         cosines = tl.cos(freqs)
         re_out = re_x * cosines - im_x * sines

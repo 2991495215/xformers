@@ -48,7 +48,13 @@ jobs:
           path: "."
           fetch-depth: 0 # for tags
 
-      - uses: actions/download-artifact@v3
+      # inspired by https://github.com/jlumbroso/free-disk-space/blob/main/action.yml
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+
+      - uses: actions/download-artifact@v4
         with:
           path: dist
       # Filter builds (eg vN+cu118 for instance)

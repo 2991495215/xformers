@@ -9,7 +9,8 @@ from typing import List, Optional, Sequence, Tuple, Type
 
 import torch
 
-from xformers.ops import fmha
+from xformers.ops import AttentionBias, fmha
+from xformers.ops.fmha.attn_bias import AttentionBiasSubTensor
 from xformers.ops.fmha.common import AttentionOpBase
 
 
@@ -38,7 +39,8 @@ def create_attn_bias(
     dtype,
     requires_grad: bool,
     fmt: str,
-    op: Type[AttentionOpBase],
+    op: Optional[Type[AttentionOpBase]] = None,
+    page_size: Optional[int] = None,
 ):
     if bias_type is None or isinstance(None, bias_type):
         return None
@@ -48,15 +50,17 @@ def create_attn_bias(
         if fmt == "BMK":
             batch_size *= num_heads
             num_heads = 1
-        # `small_k` only supports an expanded 1d bias
-        if op in [fmha.small_k.FwOp, fmha.small_k.BwOp]:
+        if op is not None and issubclass(op, fmha.triton_splitk.FwOp):
             attn_bias = (
                 torch.randn(
-                    (batch_size, num_heads, 1, kv_len), device=device, dtype=dtype
+                    (batch_size, num_heads_groups, num_heads, q_len, kv_len),
+                    device=device,
+                    dtype=dtype,
                 )
                 * 3
             )
-            attn_bias = attn_bias.expand(batch_size, num_heads, q_len, kv_len)
+            if fmt in ["BMK", "BMHK"]:
+                attn_bias = attn_bias[:, 0]
         else:
             attn_bias = _create_aligned_bias(
                 batch_size,
@@ -150,17 +154,90 @@ def create_attn_bias(
         if bias_type is fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask:
             block_diag = block_diag.make_causal_from_bottomright()
         return block_diag
-    if bias_type == fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask:
+    if bias_type in [
+        fmha.attn_bias.BlockDiagonalPaddedKeysMask,
+        fmha.attn_bias.BlockDiagonalCausalLocalAttentionPaddedKeysMask,
+        fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask,
+        fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask,
+        fmha.attn_bias.PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+    ]:
         assert fmt in ["BMHK", "BMGHK"]
         q, k = _rand_seqlens_padded_k(r, batch_size, q_len, kv_len)
-        g_block_diag = (
-            fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
+        block_diag_type = (
+            bias_type._UNPAGED_TYPE
+            if issubclass(bias_type, fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask)
+            else bias_type
+        )
+        if bias_type is fmha.attn_bias.BlockDiagonalCausalLocalAttentionPaddedKeysMask:
+            g_block_diag = block_diag_type.from_seqlens_local(
+                q_seqlen=q,
+                kv_padding=kv_len,
+                kv_seqlen=k,
+                window_size=min(window_size, min(k)),
+            )
+        else:
+            g_block_diag = block_diag_type.from_seqlens(
                 q_seqlen=q,
                 kv_padding=kv_len,
                 kv_seqlen=k,
             )
-        )
+        if issubclass(bias_type, fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask):
+            assert page_size is not None
+            pages_per_row = (kv_len + page_size - 1) // page_size
+            block_tables = torch.tensor(
+                r.sample(range(batch_size * pages_per_row), batch_size * pages_per_row),
+                device=device,
+                dtype=torch.int32,
+            ).reshape(batch_size, pages_per_row)
+            return g_block_diag.make_paged(
+                block_tables=block_tables, page_size=page_size, paged_type=bias_type
+            )
         return g_block_diag
+    if bias_type in [
+        fmha.attn_bias.BlockDiagonalCausalWithOffsetGappyKeysMask,
+        fmha.attn_bias.BlockDiagonalGappyKeysMask,
+    ]:
+        assert fmt in ["BMHK", "BMGHK"]
+        max_q_minus_k = (
+            None if bias_type is fmha.attn_bias.BlockDiagonalGappyKeysMask else 0
+        )
+        q, k = _rand_seqlens(r, batch_size, q_len, kv_len, max_q_minus_k)
+        total_kv_len = kv_len * batch_size
+        starts = [r.randint(0, total_kv_len - ki) for ki in k] + [total_kv_len]
+        return fmha.attn_bias.BlockDiagonalGappyKeysMask.from_seqlens(
+            q_seqlen=q,
+            kv_seqstarts=starts,
+            kv_seqlen=k,
+        )
+    if bias_type in [
+        fmha.attn_bias.PagedBlockDiagonalGappyKeysMask,
+    ]:
+        assert fmt in ["BMHK", "BMGHK"]
+        assert page_size is not None
+        pages_per_row = (kv_len + page_size - 1) // page_size
+        total_queries = q_len * batch_size
+        q = _rand_maxed_partition(r, total_queries, batch_size, total_queries, False)
+        k = [r.randint(1, kv_len) for _ in range(batch_size)]
+        row_size = pages_per_row * page_size
+        starts = [row_size * i + r.randint(0, row_size - ki) for i, ki in enumerate(k)]
+        starts.append(pages_per_row * batch_size * page_size)
+        block_diag_type = bias_type._UNPAGED_TYPE  # type: ignore
+        g_block_diag = block_diag_type.from_seqlens(
+            q_seqlen=q,
+            kv_seqstarts=starts,
+            kv_seqlen=k,
+        )
+        block_tables = torch.tensor(
+            r.sample(range(batch_size * pages_per_row), batch_size * pages_per_row),
+            device=device,
+            dtype=torch.int32,
+        ).reshape(batch_size, pages_per_row)
+        return g_block_diag.make_paged(
+            block_tables=block_tables,
+            page_size=page_size,
+            paged_type=bias_type,
+            notional_padding=page_size * pages_per_row,
+        )
     if bias_type == fmha.attn_bias.LocalAttentionFromBottomRightMask:
         return bias_type(
             window_left=r.randint(0, 5),
@@ -279,3 +356,146 @@ def _rand_seqlens_padded_k(
         q_seqlens = _rand_maxed_partition(r, q_len * bs, bs, kv_len)
         k_seqlens = [r.randint(i, kv_len) for i in q_seqlens]
     return q_seqlens, k_seqlens
+
+
+def ref_attention(q, k, v, attn_bias=None, drop_mask=None, p=0.0, scale=None):
+    if q.ndim == 5:
+
+        def attn_bias_group(group: int):
+            if isinstance(attn_bias, fmha.attn_bias.AttentionBiasSubTensor):
+                if attn_bias.HOLDS_DENSE_TENSOR:
+                    return attn_bias[:, group]
+            elif isinstance(attn_bias, torch.Tensor):
+                return attn_bias[:, group]
+            return attn_bias
+
+        return torch.stack(
+            [
+                ref_attention_bmhk(
+                    q[:, :, g],
+                    k[:, :, g],
+                    v[:, :, g],
+                    scale=scale,
+                    attn_bias=attn_bias_group(g),
+                )
+                for g in range(q.shape[2])
+            ],
+            dim=2,
+        )
+    if q.ndim == 4:
+        assert p == 0.0
+        return ref_attention_bmhk(q, k, v, scale=scale, attn_bias=attn_bias)
+    q = q.float()
+    k = k.float()
+    v = v.float()
+
+    scale = scale if scale is not None else (1 / q.shape[-1] ** 0.5)
+    q = q * scale
+
+    attn = q @ k.transpose(-2, -1)
+    if attn_bias is not None:
+        if isinstance(attn_bias, (AttentionBias, AttentionBiasSubTensor)):
+            # Always create in B,H,Mq,Mk format
+            attn_bias_tensor = attn_bias.materialize(
+                (q.shape[0], 1, q.shape[1], k.shape[1]),
+                device=q.device,
+                dtype=torch.float32,
+            )
+        else:
+            attn_bias_tensor = attn_bias
+        if attn_bias_tensor.ndim == 4:
+            assert q.shape[0] == attn_bias_tensor.shape[0] * attn_bias_tensor.shape[1]
+            attn_bias_tensor = attn_bias_tensor.reshape(
+                [-1, *attn_bias_tensor.shape[2:]]
+            )
+        attn = attn + attn_bias_tensor.float()
+    attn = attn.softmax(-1)
+    if drop_mask is not None:
+        attn = attn * (drop_mask / (1 - p))
+    return attn @ v
+
+
+def ref_attention_bmhk(q, k, v, attn_bias, scale=None) -> torch.Tensor:
+    assert q.ndim == 4
+
+    def T(t):
+        return t.permute((0, 2, 1, 3)).reshape(
+            [t.shape[0] * t.shape[2], t.shape[1], t.shape[3]]
+        )
+
+    if isinstance(attn_bias, (AttentionBias, AttentionBiasSubTensor)):
+        attn_bias = attn_bias.materialize(
+            (q.shape[0], q.shape[2], q.shape[1], k.shape[1]),
+            device=q.device,
+            dtype=torch.float32,
+        ).reshape([q.shape[0] * q.shape[2], q.shape[1], k.shape[1]])
+    out = ref_attention(T(q), T(k), T(v), attn_bias, scale=scale)
+    out = out.reshape([q.shape[0], q.shape[2], q.shape[1], v.shape[3]])
+    return out.permute((0, 2, 1, 3))
+
+
+def pack_kv_cache(
+    cache_k: torch.Tensor,
+    cache_v: torch.Tensor,
+    kv_seqlens: List[int],
+    BLOCK_N: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Create block tables and pages K/V cache for testing paged attention.
+    Args:
+        cache_k, cache_v: K/V caches, each of shape [B, MAX_T, H_kv, D].
+            Note that these tensors are unexpanded,
+            i.e. for multiquery case cache_k.shape[2] = 1
+        kv_seqlens: list of K/V sequence lengths
+        BLOCK_N: number of tokens per per paged attention block
+        B: batch size
+    Returns:
+        block_tables: [B, MAX_BLOCKS]
+        packed_cache_k: [1, total_len_rounded, H_kv, D]
+        packed_cache_v: [1, total_len_rounded, H_kv, D]
+    where total_len_rounded is a sum of K/V seqlens, each rounded up
+    to a multiple of BLOCK_N.
+    """
+
+    kv_seqlens_rounded = [(x + BLOCK_N - 1) // BLOCK_N * BLOCK_N for x in kv_seqlens]
+
+    total_len_rounded = sum(kv_seqlens_rounded)
+
+    B, MAX_T, H, D = cache_k.shape
+
+    packed_cache_k = torch.empty(
+        total_len_rounded, H, D, device=cache_k.device, dtype=cache_k.dtype
+    )
+    packed_cache_v = torch.empty(
+        total_len_rounded, H, D, device=cache_k.device, dtype=cache_k.dtype
+    )
+    seqstart = 0
+    for b in range(B):
+        packed_cache_k[seqstart : seqstart + kv_seqlens[b]] = cache_k[
+            b, : kv_seqlens[b]
+        ].clone()
+        packed_cache_v[seqstart : seqstart + kv_seqlens[b]] = cache_v[
+            b, : kv_seqlens[b]
+        ].clone()
+        seqstart += kv_seqlens_rounded[b]
+
+    num_blocks_per_row = (MAX_T + BLOCK_N - 1) // BLOCK_N
+    block_tables = (
+        torch.arange(num_blocks_per_row, device="cuda", dtype=torch.int32)
+        .unsqueeze(0)
+        .expand(B, num_blocks_per_row)
+    )
+    seqstarts = (
+        (
+            torch.tensor(kv_seqlens_rounded).cumsum(dim=0)
+            - torch.tensor(kv_seqlens_rounded)
+        )
+        .to(device="cuda")
+        .unsqueeze(1)
+    ) // BLOCK_N
+    block_tables = (block_tables + seqstarts).contiguous().to(dtype=torch.int32)
+    return (
+        block_tables,
+        packed_cache_k.unsqueeze(0),
+        packed_cache_v.unsqueeze(0),
+    )

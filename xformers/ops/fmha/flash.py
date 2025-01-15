@@ -5,25 +5,31 @@
 
 
 import os
-from dataclasses import replace
 from itertools import zip_longest
-from typing import Any, List, Optional, Set, Tuple, Union
+from typing import Any, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
-from ..common import _get_storage_base, get_operator, register_operator
+from ..common import get_operator, register_operator
 from .attn_bias import (
+    VARLEN_BIASES,
     AttentionBias,
     BlockDiagonalCausalFromBottomRightMask,
     BlockDiagonalCausalLocalAttentionFromBottomRightMask,
     BlockDiagonalCausalLocalAttentionMask,
+    BlockDiagonalCausalLocalAttentionPaddedKeysMask,
     BlockDiagonalCausalMask,
+    BlockDiagonalCausalWithOffsetGappyKeysMask,
     BlockDiagonalCausalWithOffsetPaddedKeysMask,
+    BlockDiagonalGappyKeysMask,
     BlockDiagonalMask,
+    BlockDiagonalPaddedKeysMask,
     LocalAttentionFromBottomRightMask,
     LowerTriangularFromBottomRightLocalAttentionMask,
     LowerTriangularFromBottomRightMask,
     LowerTriangularMask,
+    PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+    PagedBlockDiagonalPaddedKeysMask,
 )
 from .common import (
     AttentionBwOpBase,
@@ -33,8 +39,13 @@ from .common import (
     Inputs,
     check_lastdim_alignment_stride1,
 )
+from .torch_attention_compat import is_pt_flash_compatible
 
 FLASH_VERSION = "0.0.0"
+VARLEN_LSE_PACKED = False
+_TRY_PT_FLASH_ATTN = torch.version.hip is None
+_USE_PT_FLASH_ATTN = False
+
 try:
     try:
         from ... import _C_flashattention  # type: ignore[attr-defined]
@@ -42,181 +53,295 @@ try:
 
         if _build_metadata is not None:
             FLASH_VERSION = _build_metadata.flash_version
+        VARLEN_LSE_PACKED = True
     except ImportError:
-        import flash_attn
-        from flash_attn.flash_attn_interface import flash_attn_cuda as _C_flashattention
+        try:
+            import flash_attn
+            from flash_attn.flash_attn_interface import (
+                flash_attn_cuda as _C_flashattention,
+            )
 
-        FLASH_VERSION = flash_attn.__version__
-        flash_ver_parsed = tuple(int(s) for s in FLASH_VERSION.split(".")[:3])
-        if (
-            flash_ver_parsed != (2, 3, 6)
-            and os.environ.get("XFORMERS_IGNORE_FLASH_VERSION_CHECK", "0") != "1"
-        ):
-            raise ImportError("Requires Flash attention 2.3.6 for varlen_fwd api")
+            FLASH_VERSION = flash_attn.__version__
+            FLASH_VER_MIN = (2, 7, 1)
+            FLASH_VER_LAST = (2, 7, 2)  # last supported, inclusive
+            flash_ver_parsed = tuple(int(s) for s in FLASH_VERSION.split(".")[:3])
+            if (
+                flash_ver_parsed < FLASH_VER_MIN or flash_ver_parsed > FLASH_VER_LAST
+            ) and os.environ.get("XFORMERS_IGNORE_FLASH_VERSION_CHECK", "0") != "1":
+                raise ImportError(
+                    f"Requires Flash-Attention version >={'.'.join([str(i) for i in FLASH_VER_MIN])},"
+                    f"<={'.'.join([str(i) for i in FLASH_VER_LAST])} "
+                    f"but got {FLASH_VERSION}."
+                )
+            VARLEN_LSE_PACKED = True
+        except ImportError:
+            if not _TRY_PT_FLASH_ATTN:
+                raise
+            assert is_pt_flash_compatible(force=True)
+            FLASH_VERSION = torch.nn.attention._get_flash_version()  # type: ignore
+            FLASH_VERSION = f"v{FLASH_VERSION}"
+            VARLEN_LSE_PACKED = False
+            _USE_PT_FLASH_ATTN = True
 
-    # create library so that flash-attn goes through the PyTorch Dispatcher
-    _flash_lib = torch.library.Library("xformers_flash", "DEF")
-
-    _flash_lib.define(
-        "flash_fwd(Tensor query, Tensor key, Tensor value, "
-        "Tensor? cu_seqlens_q, Tensor? cu_seqlens_k, Tensor? seqused_k, "
-        "int max_seqlen_q, int max_seqlen_k, "
-        "float p, float softmax_scale, "
-        "bool is_causal, int window_left, "
-        "int window_right, bool return_softmax) -> (Tensor, Tensor, Tensor)"
+    @torch.library.custom_op(
+        "xformers_flash::flash_fwd",
+        mutates_args=(),
+        device_types=["cuda"],
     )
-
-    _flash_lib.define(
-        "flash_bwd(Tensor dout, Tensor query, Tensor key, Tensor value, "
-        "Tensor out, Tensor softmax_lse_, Tensor dq, Tensor dk, Tensor dv, "
-        "Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
-        "int max_seqlen_q, int max_seqlen_k, "
-        "float p, float softmax_scale, bool is_causal, "
-        "int window_left, int window_right, Tensor rng_state) -> (Tensor, Tensor, Tensor)"
-    )
-
     def _flash_fwd(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens_q: Optional[torch.Tensor],
+        cu_seqlens_k: Optional[torch.Tensor],
+        seqused_k: Optional[torch.Tensor],
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        p: float,
+        softmax_scale: float,
+        is_causal: bool,
+        window_left: int,
+        window_right: int,
+        return_softmax: bool,
+        block_tables: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        softcap = 0.0
+        if _USE_PT_FLASH_ATTN:
+            (
+                attention,
+                logsumexp,
+                philox_seed,
+                philox_offset,
+                _,
+            ) = torch.ops.aten._flash_attention_forward(
+                query,
+                key,
+                value,
+                cu_seqlens_q,  # cum_seq_q
+                cu_seqlens_k,  # cum_seq_k
+                max_seqlen_q,  # max_q
+                max_seqlen_k,  # max_k
+                p,  # dropout_p
+                is_causal,
+                return_debug_mask=False,
+                scale=softmax_scale,
+                window_size_left=window_left,
+                window_size_right=window_right,
+                seqused_k=seqused_k,
+                alibi_slopes=None,  # alibi_slopes
+            )
+            rng_state = torch.stack([philox_seed, philox_offset])
+            return attention, logsumexp, rng_state
+        else:
+            if cu_seqlens_q is None:
+                assert cu_seqlens_k is None
+                assert seqused_k is None
+                out, softmax_lse, p, rng_state = _C_flashattention.fwd(
+                    query,
+                    key,
+                    value,
+                    None,  # out
+                    None,  # alibi_slopes
+                    p,
+                    softmax_scale,
+                    is_causal,
+                    window_left,  # window_size_left
+                    window_right,  # window_size_right
+                    softcap,
+                    return_softmax,
+                    None,  # rng
+                )
+            else:
+                out, softmax_lse, p, rng_state = _C_flashattention.varlen_fwd(
+                    query,
+                    key,
+                    value,
+                    None,  # out
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_k,
+                    None,  # leftpad_k_
+                    block_tables,
+                    None,  # alibi_slopes
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    p,
+                    softmax_scale,
+                    False,
+                    is_causal,
+                    window_left,
+                    window_right,
+                    softcap,
+                    return_softmax,
+                    None,  # gen
+                )
+        return out, softmax_lse, rng_state
+
+    @torch.library.register_fake("xformers_flash::flash_fwd")
+    def _flash_fwd_abstract(
         query,
         key,
         value,
-        cu_seq_lens_q,
-        cu_seq_lens_k,
+        cu_seqlens_q,
+        cu_seqlens_k,
         seqused_k,
-        max_seq_len_q,
-        max_seq_len_k,
+        max_seqlen_q,
+        max_seqlen_k,
         p,
         softmax_scale,
         is_causal,
         window_left,
         window_right,
         return_softmax,
+        block_tables,
     ):
-        if cu_seq_lens_q is None:
-            assert cu_seq_lens_k is None
-            assert seqused_k is None
-            (
-                out,
-                q_padded,
-                k_padded,
-                v_padded,
-                out_padded,
-                softmax_lse,
-                p,
-                rng_state,
-            ) = _C_flashattention.fwd(
-                query,
-                key,
-                value,
-                None,  # out
-                p,
-                softmax_scale,
-                is_causal,
-                window_left,  # window_size_left
-                window_right,  # window_size_right
-                return_softmax,
-                None,  # rng
-            )
+        out = torch.empty_like(query)
+        if cu_seqlens_q is None:
+            B, M, H, K = query.shape
+            lse_shape = [B, H, M]
         else:
-            out = query.new_empty(query.shape[0], query.shape[1], value.shape[2])
-            (
-                out,
-                q_padded,
-                k_padded,
-                v_padded,
-                out_padded,
-                softmax_lse,
-                p,
-                rng_state,
-            ) = _C_flashattention.varlen_fwd(
-                query,
-                key,
-                value,
-                out,
-                cu_seq_lens_q,
-                cu_seq_lens_k,
-                seqused_k,
-                max_seq_len_q,
-                max_seq_len_k,
-                p,
-                softmax_scale,
-                False,
-                is_causal,
-                window_left,
-                window_right,
-                return_softmax,
-                None,
-            )
+            M, H, K = query.shape
+            B = cu_seqlens_q.shape[0] - 1
+            if VARLEN_LSE_PACKED:
+                lse_shape = [H, M]
+            else:
+                lse_shape = [B, H, max_seqlen_q]
+        softmax_lse = torch.empty(lse_shape, device=query.device, dtype=torch.float32)
+        rng_state = torch.empty([2], device=query.device, dtype=torch.int64)
         return out, softmax_lse, rng_state
 
+    @torch.library.custom_op(
+        "xformers_flash::flash_bwd",
+        mutates_args=(),
+        device_types=["cuda"],
+    )
     def _flash_bwd(
+        grads_share_storage: bool,
+        grad: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        p: float,
+        softmax_scale: float,
+        is_causal: bool,
+        window_left: int,
+        window_right: int,
+        rng_state: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        softcap = 0.0
+        if _USE_PT_FLASH_ATTN:
+            assert softcap == 0.0
+            if rng_state is not None:
+                philox_seed = rng_state[0]
+                philox_offset = rng_state[1]
+            else:
+                philox_seed = philox_offset = None
+            dq, dk, dv = torch.ops.aten._flash_attention_backward(
+                grad,
+                query,
+                key,
+                value,
+                out,
+                lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                p,
+                is_causal,
+                philox_seed,
+                philox_offset,
+                scale=softmax_scale,
+                window_size_left=window_left,
+                window_size_right=window_right,
+            )
+        else:
+            dq, dk, dv = _create_dq_dk_dv(grads_share_storage, query, key, value)
+            if cu_seqlens_k is None:
+                assert cu_seqlens_q is None
+                _C_flashattention.bwd(
+                    grad,
+                    query,
+                    key,
+                    value,
+                    out,
+                    lse,
+                    dq,
+                    dk,
+                    dv,
+                    None,  # alibi_slopes
+                    p,
+                    softmax_scale,
+                    is_causal,
+                    window_left,
+                    window_right,
+                    softcap,
+                    False,  # deterministic
+                    None,
+                    rng_state,
+                )
+            else:
+                _C_flashattention.varlen_bwd(
+                    grad,
+                    query,
+                    key,
+                    value,
+                    out,
+                    lse,
+                    dq,
+                    dk,
+                    dv,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    None,  # alibi_slopes
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    p,
+                    softmax_scale,
+                    False,  # zero_tensors
+                    is_causal,
+                    window_left,
+                    window_right,
+                    softcap,
+                    False,  # deterministic
+                    None,
+                    rng_state,
+                )
+        return dq, dk, dv
+
+    @torch.library.register_fake("xformers_flash::flash_bwd")
+    def _flash_bwd_abstract(
+        grads_share_storage,
         grad,
         query,
         key,
         value,
-        out,
-        lse,
-        dq,
-        dk,
-        dv,
-        cu_seq_lens_q,
-        cu_seq_lens_k,
-        max_seq_len_q,
-        max_seq_len_k,
-        p,
-        softmax_scale,
-        is_causal,
-        window_left,
-        window_right,
-        rng_state,
+        *args,
+        **kwargs,
     ):
-        if cu_seq_lens_k is None:
-            assert cu_seq_lens_q is None
-            _C_flashattention.bwd(
-                grad,
-                query,
-                key,
-                value,
-                out,
-                lse,
-                dq,
-                dk,
-                dv,
-                p,
-                softmax_scale,
-                is_causal,
-                window_left,
-                window_right,
-                None,
-                rng_state,
-            )
-        else:
-            _C_flashattention.varlen_bwd(
-                grad,
-                query,
-                key,
-                value,
-                out,
-                lse,
-                dq,
-                dk,
-                dv,
-                cu_seq_lens_q,
-                cu_seq_lens_k,
-                max_seq_len_q,
-                max_seq_len_k,
-                p,
-                softmax_scale,
-                False,  # zero_tensors
-                is_causal,
-                window_left,
-                window_right,
-                None,
-                rng_state,
-            )
-        return dq, dk, dv
+        return _create_dq_dk_dv(grads_share_storage, query, key, value)
 
-    _flash_lib.impl("flash_fwd", _flash_fwd, "CUDA")
-    _flash_lib.impl("flash_bwd", _flash_bwd, "CUDA")
+    def _create_dq_dk_dv(
+        grads_share_storage: bool, query, key, value
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Create dq,dk,dv
+        # If Q/K/V come from a single QKV tensor, let's put the gradient in the
+        # right strides, so we can avoid a `cat`
+        if grads_share_storage:
+            chunk = torch.empty(
+                (*query.shape[0:-2], 3, query.shape[-2], query.shape[-1]),
+                dtype=query.dtype,
+                device=query.device,
+            )
+            return chunk.select(-3, 0), chunk.select(-3, 1), chunk.select(-3, 2)
+        return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
+
 except ImportError:
     pass
 
@@ -242,29 +367,21 @@ def _convert_input_format(
 
     attn_bias = inp.attn_bias
     if isinstance(attn_bias, BlockDiagonalMask):
-        # BlockDiagonalMask or BlockDiagonalCausalMask
-        attn_bias.k_seqinfo.seqstart = attn_bias.k_seqinfo.seqstart.to(
-            inp.query.device, non_blocking=True
-        )
-        attn_bias.q_seqinfo.seqstart = attn_bias.q_seqinfo.seqstart.to(
-            inp.query.device, non_blocking=True
-        )
-
+        assert attn_bias.k_seqinfo.seqstart.device == inp.query.device
         cu_seqlen_k = attn_bias.k_seqinfo.seqstart
         cu_seqlen_q = attn_bias.q_seqinfo.seqstart
         max_seqlen_q = attn_bias.q_seqinfo.max_seqlen
         max_seqlen_k = attn_bias.k_seqinfo.max_seqlen
         seqused_k = None
-    elif isinstance(attn_bias, BlockDiagonalCausalWithOffsetPaddedKeysMask):
-        attn_bias.k_seqinfo.seqstart = attn_bias.k_seqinfo.seqstart.to(
-            inp.query.device, non_blocking=True
-        )
-        attn_bias.q_seqinfo.seqstart = attn_bias.q_seqinfo.seqstart.to(
-            inp.query.device, non_blocking=True
-        )
-        attn_bias.k_seqinfo.seqlen = attn_bias.k_seqinfo.seqlen.to(
-            inp.query.device, non_blocking=True
-        )
+    elif isinstance(
+        attn_bias,
+        (
+            BlockDiagonalGappyKeysMask,
+            BlockDiagonalPaddedKeysMask,
+            PagedBlockDiagonalPaddedKeysMask,
+        ),
+    ):
+        assert attn_bias.k_seqinfo.seqstart.device == inp.query.device
         cu_seqlen_k = attn_bias.k_seqinfo.seqstart
         cu_seqlen_q = attn_bias.q_seqinfo.seqstart
         max_seqlen_q = attn_bias.q_seqinfo.max_seqlen
@@ -277,7 +394,7 @@ def _convert_input_format(
         max_seqlen_q = inp.query.shape[1]
         max_seqlen_k = inp.key.shape[1]
 
-    if query.ndim == 5:  # QGA
+    if query.ndim == 5:  # GQA
         assert supports_mqa
 
         # Fold the group/head_in_group dimensions together
@@ -299,7 +416,7 @@ def _convert_input_format(
         key = fold(key)
         value = fold(value)
     # Optimize for MHA
-    if key.ndim == 4 and key.stride(2) == 0 and value.stride(2) == 0 and supports_mqa:
+    if supports_mqa and key.ndim == 4 and key.stride(2) == 0 and value.stride(2) == 0:
         key = key[:, :, :1]
         value = value[:, :, :1]
     # Initially we have `query.shape = [batch, seqlen, num_heads, head_dim_q]`
@@ -308,11 +425,20 @@ def _convert_input_format(
         query = query.reshape([batch * seqlen_q, -1, head_dim_q])
         key = key.reshape([batch * seqlen_kv, -1, head_dim_q])
         value = value.reshape([batch * seqlen_kv, -1, head_dim_v])
-    new_inp = replace(
-        inp,
+        if isinstance(attn_bias, PagedBlockDiagonalPaddedKeysMask):
+            num_pages = value.shape[0] // attn_bias.page_size
+            key = key.view(num_pages, attn_bias.page_size, *key.shape[1:])
+            value = value.view(num_pages, attn_bias.page_size, *value.shape[1:])
+
+    new_inp = Inputs(
         query=query,
         key=key,
         value=value,
+        attn_bias=attn_bias,
+        p=inp.p,
+        scale=inp.scale,
+        output_dtype=inp.output_dtype,
+        is_partial=inp.is_partial,
     )
     return new_inp, cu_seqlen_q, max_seqlen_q, cu_seqlen_k, max_seqlen_k, seqused_k
 
@@ -328,9 +454,19 @@ def _is_causal(attn_bias: Optional[Union[torch.Tensor, AttentionBias]]) -> bool:
             BlockDiagonalCausalLocalAttentionMask,
             BlockDiagonalCausalFromBottomRightMask,
             BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+            BlockDiagonalCausalLocalAttentionPaddedKeysMask,
+            BlockDiagonalCausalWithOffsetGappyKeysMask,
             BlockDiagonalCausalWithOffsetPaddedKeysMask,
+            PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
         ),
     )
+
+
+def _is_paged_attention_supported(attn_bias_type) -> bool:
+    if issubclass(attn_bias_type, PagedBlockDiagonalPaddedKeysMask):
+        return FLASH_VERSION > "2.5.6" and not _USE_PT_FLASH_ATTN
+
+    return True
 
 
 def _window_size(
@@ -343,6 +479,7 @@ def _window_size(
         (
             BlockDiagonalCausalLocalAttentionMask,
             BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+            BlockDiagonalCausalLocalAttentionPaddedKeysMask,
             LowerTriangularFromBottomRightLocalAttentionMask,
         ),
     ):
@@ -393,6 +530,39 @@ def _check_strides_for_bmghk(x: torch.Tensor, name: str, reasons: List[str]) -> 
             )
 
 
+def _post_process_lse(
+    lse: torch.Tensor,
+    inp: Inputs,
+    original_query_shape: Tuple[int, ...],
+    varlen_lse_packed: bool = VARLEN_LSE_PACKED,
+) -> torch.Tensor:
+    # Easy case: no varlen
+    if not isinstance(inp.attn_bias, VARLEN_BIASES):
+        if len(original_query_shape) == 5:
+            # [B, GH, M] => [B, G, H, M]
+            return lse.unflatten(1, original_query_shape[2:4])
+        return lse
+
+    # Already packed: just bring back the batch dimension
+    if varlen_lse_packed:
+        if len(original_query_shape) == 5:
+            # (1, G, H, total_q)
+            return lse.unflatten(0, original_query_shape[2:4]).unsqueeze(0)
+        # (1, H, total_q)
+        return lse.unsqueeze(0)
+
+    if not inp.is_partial:
+        # (B, H, M)
+        return lse
+
+    # reshape from (B, G*H, max_seqlen) to (1, G*H, B*max_seqlen)
+    # Unfortunately this flatten is not just a view.
+    lse_hkm = lse.permute(1, 0, 2).flatten(start_dim=1)[None]
+    if len(original_query_shape) == 5:
+        return lse_hkm.unflatten(1, original_query_shape[2:4])
+    return lse_hkm
+
+
 @register_operator
 class FwOp(AttentionFwOpBase):
     """Operator that computes memory-efficient attention using \
@@ -405,7 +575,7 @@ class FwOp(AttentionFwOpBase):
     CUDA_MINIMUM_COMPUTE_CAPABILITY = (8, 0)
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16}
     SUPPORTED_MAX_K = 256
-    SUPPORTED_ATTN_BIAS_TYPES: Set[Any] = {
+    SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
         type(None),
         LowerTriangularMask,
         LowerTriangularFromBottomRightMask,
@@ -414,15 +584,28 @@ class FwOp(AttentionFwOpBase):
         BlockDiagonalCausalMask,
         BlockDiagonalCausalLocalAttentionMask,
         BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+        BlockDiagonalCausalLocalAttentionPaddedKeysMask,
         BlockDiagonalCausalFromBottomRightMask,
+        BlockDiagonalCausalWithOffsetGappyKeysMask,
         BlockDiagonalCausalWithOffsetPaddedKeysMask,
+        BlockDiagonalGappyKeysMask,
+        BlockDiagonalPaddedKeysMask,
         LocalAttentionFromBottomRightMask,
-    }
+        PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+        PagedBlockDiagonalPaddedKeysMask,
+    )
+
+    SUPPORTED_ATTN_BIAS_TYPES = [
+        b for b in SUPPORTED_ATTN_BIAS_TYPES if _is_paged_attention_supported(b)
+    ]
+
     SUPPORTS_DROPOUT = True
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_DIFFERENT_VALUE_EMBED = False
     SUPPORTS_BMGHK = True
-    NAME = f"flshattF@{FLASH_VERSION}"
+    SUPPORTS_PARTIAL = True
+    VARLEN_LSE_PACKED = VARLEN_LSE_PACKED
+    NAME = f"fa2F@{FLASH_VERSION}-pt" if _USE_PT_FLASH_ATTN else f"fa2F@{FLASH_VERSION}"
     VERSION = FLASH_VERSION
 
     @classmethod
@@ -433,6 +616,16 @@ class FwOp(AttentionFwOpBase):
         _check_strides_for_bmghk(d.query, "query", reasons)
         _check_strides_for_bmghk(d.key, "key", reasons)
         _check_strides_for_bmghk(d.value, "value", reasons)
+
+        if (
+            d.is_partial
+            and not VARLEN_LSE_PACKED
+            and isinstance(d.attn_bias, VARLEN_BIASES)
+        ):
+            q_seqinfo = d.attn_bias.q_seqinfo
+            if q_seqinfo.min_seqlen != q_seqinfo.max_seqlen:
+                # Flash provides padded LSE which we don't handle.
+                reasons.append("partial attention with heterogeneous queries")
         return reasons
 
     @classmethod
@@ -440,6 +633,8 @@ class FwOp(AttentionFwOpBase):
         cls, inp: Inputs, needs_gradient: bool
     ) -> Tuple[torch.Tensor, Optional[Context]]:
         return_softmax = False
+        original_query_shape = inp.query.shape
+
         out_shape = [
             *inp.query.shape[:-1],
             inp.value.shape[-1],
@@ -453,8 +648,14 @@ class FwOp(AttentionFwOpBase):
             max_seqlen_k,
             seqused_k,
         ) = _convert_input_format(inp, supports_mqa=True)
+
         if inp.query.numel() > 0 and inp.key.numel() > 0:
             win_left, win_right = _window_size(inp.attn_bias)
+            block_tables = (
+                inp.attn_bias.block_tables
+                if isinstance(inp.attn_bias, PagedBlockDiagonalPaddedKeysMask)
+                else None
+            )
             out, softmax_lse, rng_state = cls.OPERATOR(
                 inp.query,
                 inp.key,
@@ -470,46 +671,31 @@ class FwOp(AttentionFwOpBase):
                 window_left=win_left,
                 window_right=win_right,
                 return_softmax=return_softmax,
+                block_tables=block_tables,
             )
             out = out.reshape(out_shape)
         else:
             out = torch.zeros(out_shape, device=inp.query.device, dtype=inp.query.dtype)
             rng_state = None
             softmax_lse = torch.empty(
-                [inp.query.shape[0], inp.query.shape[2], inp.query.shape[1]],
+                (
+                    [inp.query.shape[2], inp.query.shape[0] * inp.query.shape[1]]
+                    if VARLEN_LSE_PACKED and isinstance(inp.attn_bias, VARLEN_BIASES)
+                    else [inp.query.shape[0], inp.query.shape[2], inp.query.shape[1]]
+                ),
                 device=inp.query.device,
                 dtype=torch.float32,
             )
-        ctx = Context(out=out, lse=softmax_lse)
+        if not needs_gradient:
+            return out, None
+        ctx = Context(
+            out=out,
+            lse=_post_process_lse(softmax_lse, inp, original_query_shape),
+        )
         if inp.p != 0.0:
             ctx.op_bw = BwOp
             ctx.rng_state = rng_state
         return (out, ctx)
-
-    @classmethod
-    # type: ignore
-    def operator_flop(
-        cls,
-        query,
-        key,
-        value,
-        cu_seq_lens_q,
-        cu_seq_lens_k,
-        max_seq_len_q,
-        max_seq_len_k,
-        p,
-        softmax_scale,
-        causal,
-        return_softmax,
-    ) -> int:
-        return cls.attn_operator_flop(
-            query.unsqueeze(0),
-            key.unsqueeze(0),
-            value.unsqueeze(0),
-            causal=causal,
-            seqstart_k=cu_seq_lens_k,
-            seqstart_q=cu_seq_lens_q,
-        )
 
 
 @register_operator
@@ -521,31 +707,29 @@ class BwOp(AttentionBwOpBase):
     CUDA_MINIMUM_COMPUTE_CAPABILITY = FwOp.CUDA_MINIMUM_COMPUTE_CAPABILITY
     SUPPORTED_DTYPES = FwOp.SUPPORTED_DTYPES
     SUPPORTED_MAX_K = FwOp.SUPPORTED_MAX_K
-    SUPPORTED_ATTN_BIAS_TYPES = FwOp.SUPPORTED_ATTN_BIAS_TYPES.difference(
-        {BlockDiagonalCausalWithOffsetPaddedKeysMask}
+    SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = tuple(
+        set(FwOp.SUPPORTED_ATTN_BIAS_TYPES).difference(
+            {
+                BlockDiagonalCausalLocalAttentionPaddedKeysMask,
+                BlockDiagonalCausalWithOffsetGappyKeysMask,
+                BlockDiagonalCausalWithOffsetPaddedKeysMask,
+                BlockDiagonalGappyKeysMask,
+                BlockDiagonalPaddedKeysMask,
+                PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+                PagedBlockDiagonalPaddedKeysMask,
+            }
+        )
     )
     SUPPORTS_DROPOUT = FwOp.SUPPORTS_DROPOUT
     SUPPORTS_CUSTOM_SCALE = FwOp.SUPPORTS_CUSTOM_SCALE
     SUPPORTS_DIFFERENT_VALUE_EMBED = FwOp.SUPPORTS_DIFFERENT_VALUE_EMBED
     IS_DETERMINISTIC = False
     SUPPORTS_BMGHK = False  # NOTE: Don't forget to update fmha doc when changing this!
-    NAME = f"flshattB@{FLASH_VERSION}"
+    VARLEN_LSE_PACKED = VARLEN_LSE_PACKED
+    NAME = f"fa2B@{FLASH_VERSION}-pt" if _USE_PT_FLASH_ATTN else f"fa2B@{FLASH_VERSION}"
     VERSION = FLASH_VERSION
 
-    MAX_HEADDIM_SM8x = 192
-
-    @classmethod
-    def shape_not_supported_reasons(
-        cls, Mq: int, Mkv: int, K: int, Kv: int
-    ) -> List[str]:
-        reasons = super().shape_not_supported_reasons(Mq, Mkv, K, Kv)
-
-        # In fbcode in mode/dev-nosan, we get nans from flash v2.1 if there
-        # is a strange embedding dimension.
-        if K not in {8, 16, 32, 64, 128, 256}:
-            reasons.append(f"Embed dim {K} not supported")
-
-        return reasons
+    MAX_HEADDIM_DROPOUT_SM8x = 224
 
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
@@ -557,12 +741,13 @@ class BwOp(AttentionBwOpBase):
             device_capability = torch.cuda.get_device_capability(d.device)
             is_sm80_or_sm90 = device_capability in [(8, 0), (9, 0)]
             if (
-                max(d.key.shape[-1], d.query.shape[-1]) > cls.MAX_HEADDIM_SM8x
+                max(d.key.shape[-1], d.query.shape[-1]) > cls.MAX_HEADDIM_DROPOUT_SM8x
                 and not is_sm80_or_sm90
+                and d.p != 0.0
             ):
                 reasons.append(
                     "requires a GPU with compute capability 8.0 "
-                    f"(A100) or 9.0 (H100) for 'query.shape[-1] > {cls.MAX_HEADDIM_SM8x}'"
+                    f"(A100) or 9.0 (H100) for dropout when 'query.shape[-1] > {cls.MAX_HEADDIM_DROPOUT_SM8x}'"
                 )
         return reasons
 
@@ -577,109 +762,57 @@ class BwOp(AttentionBwOpBase):
             max_seqlen_k,
             seqused_k,
         ) = _convert_input_format(inp, supports_mqa=False)
-        assert ctx.lse.is_contiguous()
+        # assert ctx.lse.is_contiguous()
         assert seqused_k is None
         ctx_lse = ctx.lse
-        assert ctx_lse.shape[2] >= max_seqlen_q
-        if max_seqlen_q != ctx_lse.shape[2]:
+        if isinstance(inp.attn_bias, VARLEN_BIASES) and VARLEN_LSE_PACKED:
+            assert ctx_lse.shape[0] == 1
+            ctx_lse = ctx_lse[0]
+        else:
+            # NOTE: cutlass pads the last dimension, we need to slice it
+            assert ctx_lse.shape[2] >= max_seqlen_q
             ctx_lse = ctx_lse[:, :, :max_seqlen_q].contiguous()
         kernel_out_shape = [
             *inp.query.shape[:-1],
             inp.value.shape[-1],
         ]
+        assert grad.dtype in cls.SUPPORTED_DTYPES
 
-        # Create dq,dk,dv
-        # If Q/K/V come from a single QKV tensor, let's put the gradient in the
-        # right strides, so we can avoid a `cat`
-        if (
-            inp.query.shape[0] == inp.key.shape[0]
-            and inp.query.shape[-1] == inp.value.shape[-1]
-            and _get_storage_base(inp.query) == _get_storage_base(inp.key)
-            and _get_storage_base(inp.query) == _get_storage_base(inp.value)
-        ):
-            # Create one big contiguous chunk
-            # This is because q, k and v usually come from a single
-            # output of a linear layer that is chunked.
-            # Creating the gradients with the right layout saves us
-            # a `torch.cat` call in the backward pass
-            chunk = torch.empty(
-                (*inp.query.shape[0:-2], 3, inp.query.shape[-2], inp.query.shape[-1]),
-                dtype=inp.query.dtype,
-                device=inp.device,
-            )
+        if inp.query.numel() and inp.key.numel():
+            win_left, win_right = _window_size(inp.attn_bias)
             grads = Gradients(
-                dq=chunk.select(-3, 0),
-                dk=chunk.select(-3, 1),
-                dv=chunk.select(-3, 2),
+                *cls.OPERATOR(
+                    ctx.qkv_share_storage,
+                    grad.reshape(kernel_out_shape).contiguous(),
+                    inp.query,
+                    inp.key,
+                    inp.value,
+                    ctx.out.reshape(kernel_out_shape),
+                    ctx_lse,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    inp.p,
+                    inp.scale_float,
+                    _is_causal(inp.attn_bias),
+                    window_left=win_left,
+                    window_right=win_right,
+                    rng_state=ctx.rng_state if inp.p > 0.0 else None,
+                )
             )
         else:
             grads = Gradients(
-                dq=torch.empty_like(inp.query),
-                dk=torch.empty_like(inp.key),
-                dv=torch.empty_like(inp.value),
+                dq=torch.zeros_like(inp.query),
+                dk=torch.zeros_like(inp.key),
+                dv=torch.zeros_like(inp.value),
             )
-
-        assert grad.dtype in cls.SUPPORTED_DTYPES
-
         if grads.dq.numel() == 0:
             grads.dk.zero_()
             grads.dv.zero_()
         if grads.dv.numel() == 0:
             grads.dq.zero_()
-        if grads.dq.numel() and grads.dk.numel():
-            win_left, win_right = _window_size(inp.attn_bias)
-            cls.OPERATOR(
-                grad.reshape(kernel_out_shape).contiguous(),
-                inp.query,
-                inp.key,
-                inp.value,
-                ctx.out.reshape(kernel_out_shape),
-                ctx_lse,
-                grads.dq,
-                grads.dk,
-                grads.dv,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                inp.p,
-                inp.scale_float,
-                _is_causal(inp.attn_bias),
-                window_left=win_left,
-                window_right=win_right,
-                rng_state=ctx.rng_state,
-            )
         grads.dq = grads.dq.reshape(dq_shape)
         grads.dk = grads.dk.reshape(dk_shape)
         grads.dv = grads.dv.reshape(dv_shape)
         return grads
-
-    @classmethod
-    # type: ignore
-    def operator_flop(
-        cls,
-        grad,
-        query,
-        key,
-        value,
-        out,
-        lse,
-        dq,
-        dk,
-        dv,
-        cu_seq_lens_q,
-        cu_seq_lens_k,
-        max_seq_len_q,
-        max_seq_len_k,
-        p,
-        softmax_scale,
-        causal,
-    ) -> int:
-        return cls.attn_operator_flop(
-            query.unsqueeze(0),
-            key.unsqueeze(0),
-            value.unsqueeze(0),
-            causal=causal,
-            seqstart_k=cu_seq_lens_k,
-            seqstart_q=cu_seq_lens_q,
-        )
